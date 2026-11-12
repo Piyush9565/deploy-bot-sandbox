@@ -1,0 +1,24 @@
+# Test app shaped like a Peddle prod app: chart from an OCI registry, values from a Git repo
+# (the ped-sot stand-in), and manual sync. Deploying = bump image.tag in apps/podinfo/values.yaml,
+# merge, then run /deploy podinfo in Slack.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: podinfo
+  namespace: argocd
+spec:
+  project: sandbox
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: podinfo
+  syncPolicy: {}
+  sources:
+    - repoURL: ghcr.io/stefanprodan/charts
+      chart: podinfo
+      targetRevision: 6.17.0
+      helm:
+        valueFiles:
+          - $values/apps/podinfo/values.yaml
+    - repoURL: https://github.com/Piyush9565/deploy-bot-sandbox.git
+      targetRevision: main
+      ref: values
