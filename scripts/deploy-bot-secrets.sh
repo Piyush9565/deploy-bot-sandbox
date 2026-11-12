@@ -14,8 +14,15 @@ fi
 
 echo "Log in to ArgoCD as admin, so the script can create the bot's API token:"
 argocd login 127.0.0.1:30443 --insecure --username admin
+# Revoke earlier bot tokens (including ones from aborted runs) so only the new one works.
+for id in $(argocd account get --account slack-deployer -o json \
+    | python3 -c 'import json, sys; print(" ".join(t["id"] for t in json.load(sys.stdin).get("tokens") or []))'); do
+  argocd account delete-token --account slack-deployer "$id" >/dev/null
+done
 ARGOCD_TOKEN=$(argocd account generate-token --account slack-deployer --id "slack-deploy-bot-$(date +%Y%m%d%H%M%S)")
-argocd logout 127.0.0.1:30443 >/dev/null
+# `argocd logout` can hang on this setup, so cap it and drop the local admin session either way.
+timeout 15 argocd logout 127.0.0.1:30443 >/dev/null 2>&1 || true
+rm -f "$HOME/.config/argocd/config"
 
 env_file=$(mktemp -p /dev/shm)
 trap 'rm -f "$env_file"' EXIT
