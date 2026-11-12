@@ -56,6 +56,22 @@ def code_list(items):
     return ", ".join(f"`{i}`" for i in items) or "_none_"
 
 
+def image_repo(image):
+    name = image.split("@", 1)[0]
+    head, _, tail = name.rpartition(":")
+    return head if head and "/" not in tail else name
+
+
+def images_match(live, expected):
+    """Every expected image is running, and no other tag of those images is left behind.
+
+    Live images can include extras (chart test hooks, sidecars), so this isn't an equality check.
+    """
+    repos = {image_repo(i) for i in expected}
+    stale = [i for i in live if image_repo(i) in repos and i not in expected]
+    return set(expected) <= set(live) and not stale
+
+
 # --- ArgoCD API ---------------------------------------------------------------
 
 
@@ -146,7 +162,7 @@ def wait_for_rollout(name, started_at, expected_images):
         if phase in ("Failed", "Error"):
             return False, f"sync {phase.lower()}: {operation.get('message', '')[:300]}"
         live = sorted(status.get("summary", {}).get("images", []))
-        if phase == "Succeeded" and health == "Healthy" and live == expected_images:
+        if phase == "Succeeded" and health == "Healthy" and images_match(live, expected_images):
             return True, "synced, healthy, and running the expected images"
     minutes = SYNC_TIMEOUT_SECONDS // 60
     return False, f"timed out after {minutes} min (sync: {phase}, health: {health})"
@@ -218,7 +234,7 @@ def deploy_command(ack, command, respond, client):
         audit("plan_failed", user=user, app=name, error=str(e))
         respond(f"Couldn't read `{name}` from ArgoCD: {e}")
         return
-    if plan["sync_status"] == "Synced" and plan["live_images"] == plan["target_images"]:
+    if plan["sync_status"] == "Synced" and images_match(plan["live_images"], plan["target_images"]):
         respond(f"`{name}` is already up to date ({code_list(plan['live_images'])}).")
         return
     payload = {
