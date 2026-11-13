@@ -1,0 +1,122 @@
+# Slack deploy bot: everything it needs, in one values file (like a service's values.yaml in ped-sot).
+# Rendered by the generic bjw-s "app-template" chart, standing in for Peddle's containerized-app chart.
+# No secrets live here: tokens and allowlists are SecureString parameters in SSM Parameter Store
+# under /slack-deploy-bot/, pulled into the cluster by External Secrets.
+
+defaultPodOptions:
+  automountServiceAccountToken: false  # the bot talks to ArgoCD's API, never to Kubernetes directly
+  imagePullSecrets:
+    - name: ecr-pull  # short-lived ECR login, refreshed by External Secrets (see rawResources)
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+  # Prod EKS: keep the pod on the Karpenter pool that only consolidates empty nodes.
+  # tolerations:
+  #   - key: peddle/graviton-taint-no-rebalance
+  #     operator: Exists
+  #     effect: NoSchedule
+
+controllers:
+  slack-deploy-bot:
+    replicas: 1
+    strategy: Recreate  # one Slack Socket Mode connection at a time
+    containers:
+      bot:
+        image:
+          repository: 885287756345.dkr.ecr.ap-southeast-2.amazonaws.com/slack-deploy-bot
+          tag: 17771a0
+        env:
+          ARGOCD_URL: https://argocd-server.argocd.svc
+          ARGOCD_VERIFY_TLS: "false"  # test cluster uses ArgoCD's self-signed certificate
+          SYNC_TIMEOUT_SECONDS: "600"
+          CONFIRM_TTL_SECONDS: "300"
+        envFrom:
+          - secretRef:
+              name: slack-deploy-bot-secrets  # created by the ExternalSecret below
+        resources:
+          requests:
+            cpu: 50m
+            memory: 96Mi
+          limits:
+            memory: 256Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+
+rawResources:
+  # Where External Secrets reads from: SSM Parameter Store in this account and region.
+  # No auth block, so it uses the node's IAM role (prod: an IRSA role bound to this namespace).
+  parameter-store:
+    forceRename: parameter-store
+    manifest:
+      apiVersion: external-secrets.io/v1
+      kind: SecretStore
+      spec:
+        provider:
+          aws:
+            service: ParameterStore
+            region: ap-southeast-2
+
+  # SecureString parameters -> Kubernetes Secret "slack-deploy-bot-secrets" (the pod's envFrom).
+  bot-secrets:
+    forceRename: slack-deploy-bot-secrets
+    manifest:
+      apiVersion: external-secrets.io/v1
+      kind: ExternalSecret
+      spec:
+        refreshInterval: 5m
+        secretStoreRef:
+          kind: SecretStore
+          name: parameter-store
+        target:
+          name: slack-deploy-bot-secrets
+        data:
+          - secretKey: SLACK_BOT_TOKEN
+            remoteRef:
+              key: /slack-deploy-bot/SLACK_BOT_TOKEN
+          - secretKey: SLACK_APP_TOKEN
+            remoteRef:
+              key: /slack-deploy-bot/SLACK_APP_TOKEN
+          - secretKey: ARGOCD_TOKEN
+            remoteRef:
+              key: /slack-deploy-bot/ARGOCD_TOKEN
+          - secretKey: ALLOWED_USER_IDS
+            remoteRef:
+              key: /slack-deploy-bot/ALLOWED_USER_IDS
+          - secretKey: ALLOWED_CHANNEL_IDS
+            remoteRef:
+              key: /slack-deploy-bot/ALLOWED_CHANNEL_IDS
+
+  # ECR login for pulling the image, the same generator Peddle prod uses for ArgoCD (ecr-auth.tf).
+  ecr-token:
+    forceRename: ecr
+    manifest:
+      apiVersion: generators.external-secrets.io/v1alpha1
+      kind: ECRAuthorizationToken
+      spec:
+        region: ap-southeast-2
+
+  # ECR token -> docker-registry Secret "ecr-pull". ECR tokens last 12h, so refresh every 6h.
+  # The {{ "{{" }} ... {{ "}}" }} escapes stop Helm from rendering External Secrets' own template.
+  ecr-pull:
+    forceRename: ecr-pull
+    manifest:
+      apiVersion: external-secrets.io/v1
+      kind: ExternalSecret
+      spec:
+        refreshInterval: 6h
+        target:
+          name: ecr-pull
+          template:
+            type: kubernetes.io/dockerconfigjson
+            data:
+              .dockerconfigjson: '{"auths":{"{{ "{{" }} .proxy_endpoint {{ "}}" }}":{"username":"{{ "{{" }} .username {{ "}}" }}","password":"{{ "{{" }} .password {{ "}}" }}","auth":"{{ "{{" }} printf "%s:%s" .username .password | b64enc {{ "}}" }}"}}}'
+        dataFrom:
+          - sourceRef:
+              generatorRef:
+                apiVersion: generators.external-secrets.io/v1alpha1
+                kind: ECRAuthorizationToken
+                name: ecr

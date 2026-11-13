@@ -2,12 +2,13 @@
 
 Test bed for a Slack `/deploy` bot that syncs ArgoCD applications, as a non-agent alternative
 to the Release Agent idea. Only allowlisted Slack users in allowlisted channels can deploy, and
-the bot only syncs what is already merged here.
+the bot only syncs what is already merged here. Laid out like Peddle prod: this repo plays the
+part of ped-sot (values) and devops-infrastructure (ArgoCD apps).
 
 | Path | What it is |
 |---|---|
-| `apps/podinfo/values.yaml` | Stand-in for ped-sot. Bump `image.tag`, merge to `main`, then run `/deploy podinfo` in Slack. |
-| `bot/` | The bot (Python, Slack Socket Mode, ArgoCD API). |
-| `k8s/bot.yaml` | Bot Deployment and settings for the test cluster. |
-| `k8s/podinfo-app.yaml` | Test ArgoCD app shaped like a Peddle prod app: chart from OCI, values from Git, manual sync. |
-| `scripts/deploy-bot-secrets.sh` | Run on the test box to store the Slack and ArgoCD tokens. No secrets live in this repo. |
+| `apps/podinfo/values.yaml` | Test app's values (stand-in for a service in ped-sot). Change `image.tag`, merge to `main`, then run `/deploy podinfo` in Slack. |
+| `apps/slack-deploy-bot/values.yaml` | Everything the bot needs: pod, image from ECR, and External Secrets that pull its tokens and allowlist from SSM Parameter Store. |
+| `argocd/` | ArgoCD apps and project: External Secrets, the `devops` project, the bot, and podinfo. |
+| `bot/` | Bot code (Python, Slack Socket Mode, ArgoCD API), Dockerfile, and CodeBuild buildspec. |
+| `scripts/deploy-bot-ssm-secrets.sh` | Run on the test box to store the Slack and ArgoCD tokens in SSM. No secrets live in this repo. |

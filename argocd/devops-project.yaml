@@ -1,0 +1,29 @@
+# ArgoCD project for DevOps tooling, like Peddle's "devops" project. The bot's own app lives here,
+# and the bot's ArgoCD account has no rights in it, so the bot can never redeploy itself.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: devops
+  namespace: argocd
+spec:
+  description: DevOps tooling, including the Slack deploy bot
+  sourceRepos:
+    - ghcr.io/bjw-s-labs/helm
+    - https://github.com/Piyush9565/deploy-bot-sandbox.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: slack-deploy-bot
+---
+# Public OCI registry for the generic app-template chart (stand-in for Peddle's ECR chart repo).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-app-template
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: repository
+stringData:
+  type: helm
+  name: app-template
+  url: ghcr.io/bjw-s-labs/helm
+  enableOCI: "true"
