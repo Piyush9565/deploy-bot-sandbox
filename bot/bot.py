@@ -53,7 +53,11 @@ ALLOWED_CHANNELS = {c.strip() for c in os.environ["ALLOWED_CHANNEL_IDS"].split("
 SYNC_TIMEOUT_SECONDS = int(os.environ.get("SYNC_TIMEOUT_SECONDS", "600"))
 CONFIRM_TTL_SECONDS = int(os.environ.get("CONFIRM_TTL_SECONDS", "300"))
 POLL_SECONDS = 5
-MAX_APPS_PER_REQUEST = 10
+MAX_APPS_PER_REQUEST = 30  # Peddle's biggest ArgoCD project (universal) has 29 apps
+MAX_PARALLEL_SYNCS = 10  # bigger requests deploy 10 apps at a time
+# Words people add around a project name: "/deploy all buyer services" means project "buyer".
+SCOPE_FILLER = {"service", "services", "app", "apps", "application", "applications", "project", "projects",
+                "the", "in", "of"}
 APP_NAME = re.compile(r"[a-z0-9]([-a-z0-9]{0,251}[a-z0-9])?")
 
 argocd = requests.Session()
@@ -358,7 +362,8 @@ def request_blocks(request, title, footer, phase, results=None, buttons=False):
             mrkdwn(f"*{new_label}*\n{versions(entry['images'])}"),
         ]})
     else:
-        blocks.append(context(f"Requested by <@{request['requester']}>  ·  {len(apps)} apps"))
+        where = f"  ·  project {app_list(request['projects'])}" if request.get("projects") else ""
+        blocks.append(context(f"Requested by <@{request['requester']}>  ·  {len(apps)} apps{where}"))
         for start in range(0, len(apps), 4):  # a section holds 10 fields: a header row + 4 apps
             fields = [mrkdwn("*Application*"), mrkdwn("*Version*")]
             for entry in apps[start:start + 4]:
@@ -386,9 +391,18 @@ def update_request(client, channel, ts, request, title, footer, phase, results=N
 
 
 def subject(request):
-    """How a request is named in titles: the app, or "N apps"."""
+    """How a request is named in titles: the app, "N apps", or "all buyer apps (N)"."""
     apps = request["apps"]
-    return apps[0]["app"] if len(apps) == 1 else f"{len(apps)} apps"
+    if len(apps) == 1:
+        return apps[0]["app"]
+    if request.get("projects"):
+        return f"all {' + '.join(request['projects'])} apps ({len(apps)})"
+    return f"{len(apps)} apps"
+
+
+def parallel_note(count):
+    return (f"All {count} apps deploy at the same time" if count <= MAX_PARALLEL_SYNCS
+            else f"{count} apps deploy {MAX_PARALLEL_SYNCS} at a time")
 
 
 def suggestion_blocks(typed, matches, action_prefix, verb):
@@ -443,13 +457,65 @@ def deploy_command(ack, command, respond, client):
         respond("You're not allowed to deploy from here.")
         return
     if not names:
-        usage = "Usage: `/deploy <app> [more apps…]`, e.g. `/deploy seller-offer-service buyer-service`"
+        usage = ("Usage: `/deploy <app> [more apps…]` or `/deploy all <project>`, "
+                 "e.g. `/deploy seller-offer-service buyer-service` or `/deploy all buyer`")
         try:
-            respond(f"{usage}\nApps you can deploy: {app_list(deployable_apps())}")
+            respond(f"{usage}\nApps you can deploy: {app_list(deployable_apps())}\n"
+                    f"Projects: {app_list(deployable_projects())}")
         except Exception as e:  # noqa: BLE001 - report any ArgoCD problem back to Slack
             respond(f"{usage}\n(couldn't list apps from ArgoCD: {e})")
         return
+    if names[0] == "all":
+        deploy_projects([w for w in names[1:] if w not in SCOPE_FILLER], user, channel, client, respond)
+        return
     request_deploy(names, user, channel, client, respond)
+
+
+def deployable_projects():
+    return sorted({project for _, project in list_apps() if project and can_sync(project)})
+
+
+def apps_in_projects(projects, respond):
+    """Every app in the named ArgoCD projects, or None after explaining privately what's wrong."""
+    apps = list_apps()
+    known = sorted({p for _, p in apps if p})
+    problems, chosen = [], []
+    for project in projects:
+        if project not in known:
+            matches = suggest(project, known)
+            hint = f"Did you mean {app_list(matches)}?" if matches else f"Projects: {app_list(known)}"
+            problems.append(f"• There's no ArgoCD project called `{project}`. {hint}")
+        elif not can_sync(project):
+            problems.append(f"• This bot isn't allowed to deploy apps in project `{project}`.")
+        else:
+            chosen += sorted(n for n, p in apps if p == project)
+    if problems:
+        respond(":warning: I didn't create a deploy request:\n" + "\n".join(problems))
+        return None
+    return chosen
+
+
+def deploy_projects(projects, user, channel, client, respond):
+    """`/deploy all <project>`: deploy every app in the project that has something new."""
+    if not projects:
+        try:
+            respond(f"Usage: `/deploy all <project>`, e.g. `/deploy all buyer`\n"
+                    f"Projects you can deploy: {app_list(deployable_projects())}")
+        except Exception as e:  # noqa: BLE001 - report any ArgoCD problem back to Slack
+            respond(f"Usage: `/deploy all <project>` (couldn't list projects from ArgoCD: {e})")
+        return
+    try:
+        names = apps_in_projects(projects, respond)
+    except Exception as e:  # noqa: BLE001 - report any ArgoCD problem back to Slack
+        respond(f"Couldn't read the projects from ArgoCD: {e}")
+        return
+    if names is None:
+        return
+    if not names:
+        respond(f"There are no apps in project {app_list(projects)}.")
+        return
+    audit("deploy_all_requested", user=user, projects=projects, apps=names)
+    request_deploy(names, user, channel, client, respond, projects=projects)
 
 
 @app.action(re.compile(r"suggest_deploy_\d+"))
@@ -479,13 +545,16 @@ def check_app(name):
     return "ready", plan
 
 
-def request_deploy(names, user, channel, client, respond):
-    """Post one deploy request for the apps, or explain privately why not (with suggestions on typos)."""
+def request_deploy(names, user, channel, client, respond, projects=None):
+    """Post one deploy request for the apps, or explain privately why not (with suggestions on typos).
+
+    `projects` is set for `/deploy all <project>`, and only changes how the request is titled.
+    """
     if len(names) > MAX_APPS_PER_REQUEST:
         respond(f"I can deploy up to {MAX_APPS_PER_REQUEST} apps at once; you listed {len(names)}.")
         return
     try:
-        with ThreadPoolExecutor(max_workers=len(names)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(names), MAX_PARALLEL_SYNCS)) as pool:
             checks = dict(zip(names, pool.map(check_app, names)))
         not_found = [n for n, (status, _) in checks.items() if status == "not_found"]
         not_permitted = {n: project for n, (status, project) in checks.items() if status == "not_permitted"}
@@ -524,7 +593,8 @@ def request_deploy(names, user, channel, client, respond):
     ready = [(n, plan) for n, (status, plan) in checks.items() if status == "ready"]
     skipped = [n for n, (status, _) in checks.items() if status == "up_to_date"]
     if not ready:
-        respond(":white_check_mark: Already up to date: " + ", ".join(
+        where = f" in project {app_list(projects)}" if projects else ""
+        respond(f":white_check_mark: Everything{where} is already up to date: " + ", ".join(
             f"`{n}` {versions(checks[n][1]['live_images'])}" for n in names))
         return
 
@@ -534,6 +604,7 @@ def request_deploy(names, user, channel, client, respond):
         "expires": int(time.time()) + CONFIRM_TTL_SECONDS,
         "status": "open",
         "skipped": skipped,
+        "projects": projects or [],
         "apps": [{
             "app": n,
             "revisions": plan["revisions"],  # pinned for the sync, not shown
@@ -548,7 +619,7 @@ def request_deploy(names, user, channel, client, respond):
         plan = ready[0][1]
         footer = f"ArgoCD: {state(plan['sync_status'])}  ·  {state(plan['health'])}   |   {until}"
     else:
-        footer = f"All {len(ready)} apps deploy at the same time   |   {until}"
+        footer = f"{parallel_note(len(ready))}   |   {until}"
     title = f":rocket:  Deploy {subject(request)}?"
     client.chat_postMessage(channel=channel, text=title,
                             blocks=request_blocks(request, title, footer, "open", buttons=True))
@@ -648,13 +719,14 @@ def run_deploys(client, channel, message_ts, request, user):
                            "deploying", snapshot)
 
     if multi:
-        say(f"Syncing {len(apps)} apps in ArgoCD at the same time: {app_list([a['app'] for a in apps])}. "
+        how = "at the same time" if len(apps) <= MAX_PARALLEL_SYNCS else f"{MAX_PARALLEL_SYNCS} at a time"
+        say(f"Syncing {len(apps)} apps in ArgoCD {how}: {app_list([a['app'] for a in apps], MAX_APPS_PER_REQUEST)}. "
             f"I'll post each result here (timeout {SYNC_TIMEOUT_SECONDS // 60} min each).")
     else:
         say(f"Syncing `{apps[0]['app']}` in ArgoCD. I'll post here when it's done "
             f"(timeout {SYNC_TIMEOUT_SECONDS // 60} min).")
     try:
-        with ThreadPoolExecutor(max_workers=len(apps)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(apps), MAX_PARALLEL_SYNCS)) as pool:
             list(pool.map(deploy_one, apps))
     finally:
         with in_flight_lock:
@@ -684,10 +756,49 @@ def status_command(ack, command, respond):
         respond("This command only works in the deploy channel.")
         return
     if not names:
-        respond(f"Usage: `/deploy-status <app> [more apps…]`\nApps: {app_list(sorted(n for n, _ in list_apps()))}")
+        respond(f"Usage: `/deploy-status <app> [more apps…]` or `/deploy-status all <project>`\n"
+                f"Apps: {app_list(sorted(n for n, _ in list_apps()))}")
+        return
+    if names[0] == "all":
+        project_status([w for w in names[1:] if w not in SCOPE_FILLER], respond)
         return
     for name in names[:MAX_APPS_PER_REQUEST]:
         show_status(name, respond)
+
+
+def project_status(projects, respond):
+    """`/deploy-status all <project>`: one row per app with its running tag, sync and health."""
+    apps = list_apps()
+    known = sorted({p for _, p in apps if p})
+    if not projects:
+        respond(f"Usage: `/deploy-status all <project>`\nProjects: {app_list(known)}")
+        return
+    for project in projects:
+        if project not in known:
+            matches = suggest(project, known)
+            hint = f"Did you mean {app_list(matches)}?" if matches else f"Projects: {app_list(known)}"
+            respond(f":mag: There's no ArgoCD project called `{project}`. {hint}")
+            continue
+        names = sorted(n for n, p in apps if p == project)
+        with ThreadPoolExecutor(max_workers=min(len(names), MAX_PARALLEL_SYNCS)) as pool:
+            details = list(pool.map(get_app, names))
+        rows, waiting = [], 0
+        for name, application in zip(names, details):
+            status = (application or {}).get("status", {})
+            sync = status.get("sync", {}).get("status", "Unknown")
+            health = status.get("health", {}).get("status", "Unknown")
+            waiting += sync == "OutOfSync"
+            running = versions(sorted(status.get("summary", {}).get("images", [])))
+            rows.append((name, f"{running}  ·  {state(sync)}  ·  {state(health)}"))
+        blocks = [header(f":mag:  {project}  ({len(names)} apps)")]
+        for start in range(0, len(rows), 4):  # a section holds 10 fields: a header row + 4 apps
+            fields = [mrkdwn("*Application*"), mrkdwn("*Running  ·  Sync  ·  Health*")]
+            for name, line in rows[start:start + 4]:
+                fields += [mrkdwn(f"`{name}`"), mrkdwn(line)]
+            blocks.append({"type": "section", "fields": fields})
+        blocks.append(context(f"{waiting} of {len(names)} have changes waiting: `/deploy all {project}`"
+                              if waiting else "Everything is in sync."))
+        respond(text=f"{project}: {len(names)} apps", blocks=blocks)
 
 
 @app.action(re.compile(r"suggest_status_\d+"))
