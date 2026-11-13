@@ -240,15 +240,24 @@ def context(text):
     return {"type": "context", "elements": [mrkdwn(text)]}
 
 
-def request_blocks(payload, title, footer, buttons=False):
+# Labels for the old and new versions, so they read right at each stage of a request.
+OPEN = ("Running now", "Will deploy")
+DEPLOYING = ("Running now", "Deploying")
+DEPLOYED = ("Previous version", "Now running")
+FAILED = ("Before", "Attempted")
+NOT_DEPLOYED = ("Running now", "Not deployed")
+
+
+def request_blocks(payload, title, footer, labels=OPEN, buttons=False):
     """A deploy request: title, application and versions, a one-line status, and buttons while open."""
+    old_label, new_label = labels
     blocks = [
         header(title),
         {"type": "section", "fields": [
             mrkdwn(f"*Application*\n`{payload['app']}`"),
             mrkdwn(f"*Requested by*\n<@{payload['requester']}>"),
-            mrkdwn(f"*Running now*\n{versions(payload['live'])}"),
-            mrkdwn(f"*Will deploy*\n{versions(payload['images'])}"),
+            mrkdwn(f"*{old_label}*\n{versions(payload['live'])}"),
+            mrkdwn(f"*{new_label}*\n{versions(payload['images'])}"),
         ]},
         context(footer),
     ]
@@ -263,10 +272,10 @@ def request_blocks(payload, title, footer, buttons=False):
     return blocks
 
 
-def update_request(client, channel, ts, payload, title, footer):
+def update_request(client, channel, ts, payload, title, footer, labels):
     """Rewrite the request message in place, without buttons, to show where the deploy stands."""
     client.chat_update(channel=channel, ts=ts, text=title,
-                       blocks=request_blocks(payload, title, footer))
+                       blocks=request_blocks(payload, title, footer, labels))
 
 
 # --- Slack handlers --------------------------------------------------------------
@@ -311,7 +320,7 @@ def deploy_command(ack, command, respond, client):
               f"{slack_time(payload['expires'], 'in 5 minutes', '{time}')}")
     client.chat_postMessage(
         channel=channel, text=f"Deploy {name}?",
-        blocks=request_blocks(payload, f":rocket:  Deploy {name}?", footer, buttons=True),
+        blocks=request_blocks(payload, f":rocket:  Deploy {name}?", footer, OPEN, buttons=True),
     )
     audit("deploy_requested", user=user, channel=channel, app=name,
           revisions=plan["revisions"], images=plan["target_images"])
@@ -328,7 +337,7 @@ def deploy_cancel(ack, body, client, respond):
         return
     update_request(client, body["channel"]["id"], body["message"]["ts"], payload,
                    f":no_entry_sign:  Deploy cancelled: {payload['app']}",
-                   f"Cancelled by <@{user}>. Nothing was deployed.")
+                   f"Cancelled by <@{user}>. Nothing was deployed.", NOT_DEPLOYED)
     audit("deploy_cancelled", user=user, app=payload["app"])
 
 
@@ -347,7 +356,7 @@ def deploy_confirm(ack, body, client, respond):
     if time.time() > payload["expires"]:
         update_request(client, channel, message_ts, payload,
                        f":hourglass:  Deploy request expired: {name}",
-                       f"Nothing was deployed. Run `/deploy {name}` again.")
+                       f"Nothing was deployed. Run `/deploy {name}` again.", NOT_DEPLOYED)
         return
     with in_flight_lock:
         if name in in_flight:
@@ -357,7 +366,7 @@ def deploy_confirm(ack, body, client, respond):
         in_flight.add(name)
     update_request(client, channel, message_ts, payload,
                    f":hourglass_flowing_sand:  Deploying {name}",
-                   f"Confirmed by <@{user}>  ·  syncing in ArgoCD, progress in the thread")
+                   f"Confirmed by <@{user}>  ·  syncing in ArgoCD, progress in the thread", DEPLOYING)
     threading.Thread(
         target=run_deploy, args=(client, channel, message_ts, payload, user), daemon=True,
     ).start()
@@ -374,11 +383,11 @@ def run_deploy(client, channel, message_ts, payload, user):
         took = duration(time.monotonic() - clock)
         if ok:
             update_request(client, channel, message_ts, payload, f":white_check_mark:  Deployed {name}",
-                           f"Confirmed by <@{user}>  ·  healthy after {took}")
+                           f"Confirmed by <@{user}>  ·  healthy after {took}", DEPLOYED)
             say(f":white_check_mark: `{name}` is running {versions(payload['images'])} and healthy ({took}).")
         else:
             update_request(client, channel, message_ts, payload, f":x:  Deploy failed: {name}",
-                           f"Confirmed by <@{user}>  ·  failed after {took}, details in the thread")
+                           f"Confirmed by <@{user}>  ·  failed after {took}, details in the thread", FAILED)
             say(f":x: `{name}`: {detail}")
 
     try:
