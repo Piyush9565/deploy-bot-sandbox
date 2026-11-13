@@ -8,22 +8,7 @@ metadata:
 spec:
   description: DevOps tooling, including the Slack deploy bot
   sourceRepos:
-    - ghcr.io/bjw-s-labs/helm
     - https://github.com/Piyush9565/deploy-bot-sandbox.git
   destinations:
     - server: https://kubernetes.default.svc
       namespace: slack-deploy-bot
----
-# Public OCI registry for the generic app-template chart (stand-in for Peddle's ECR chart repo).
-apiVersion: v1
-kind: Secret
-metadata:
-  name: repo-app-template
-  namespace: argocd
-  labels:
-    argocd.argoproj.io/secret-type: repository
-stringData:
-  type: helm
-  name: app-template
-  url: ghcr.io/bjw-s-labs/helm
-  enableOCI: "true"

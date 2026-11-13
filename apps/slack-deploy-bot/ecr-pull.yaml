@@ -1,0 +1,37 @@
+# ECR login for pulling the bot image: the same External Secrets generator Peddle prod uses for
+# ArgoCD (ped-terraform/production/eks/ecr-auth.tf). ECR tokens last 12h, so refresh every 6h.
+apiVersion: generators.external-secrets.io/v1alpha1
+kind: ECRAuthorizationToken
+metadata:
+  name: ecr
+  namespace: slack-deploy-bot
+  labels:
+    app.kubernetes.io/name: slack-deploy-bot
+spec:
+  region: ap-southeast-2
+  # auth:
+  #   jwt:
+  #     serviceAccountRef:
+  #       name: slack-deploy-bot
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: ecr-pull
+  namespace: slack-deploy-bot
+  labels:
+    app.kubernetes.io/name: slack-deploy-bot
+spec:
+  refreshInterval: 6h
+  target:
+    name: ecr-pull
+    template:
+      type: kubernetes.io/dockerconfigjson
+      data:
+        .dockerconfigjson: '{"auths":{"{{ .proxy_endpoint }}":{"username":"{{ .username }}","password":"{{ .password }}","auth":"{{ printf "%s:%s" .username .password | b64enc }}"}}}'
+  dataFrom:
+    - sourceRef:
+        generatorRef:
+          apiVersion: generators.external-secrets.io/v1alpha1
+          kind: ECRAuthorizationToken
+          name: ecr

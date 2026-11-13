@@ -1,5 +1,5 @@
-# The deploy bot's own ArgoCD app, built like a Peddle prod app: chart from an OCI registry,
-# values from Git (apps/slack-deploy-bot/values.yaml), manual sync.
+# The deploy bot's own ArgoCD app: plain Kubernetes manifests from apps/slack-deploy-bot/ in Git
+# (no Helm), manual sync like a Peddle prod app.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -11,14 +11,7 @@ spec:
     server: https://kubernetes.default.svc
     namespace: slack-deploy-bot
   syncPolicy: {}
-  sources:
-    - repoURL: ghcr.io/bjw-s-labs/helm
-      chart: app-template
-      targetRevision: 5.3.0
-      helm:
-        releaseName: slack-deploy-bot
-        valueFiles:
-          - $values/apps/slack-deploy-bot/values.yaml
-    - repoURL: https://github.com/Piyush9565/deploy-bot-sandbox.git
-      targetRevision: main
-      ref: values
+  source:
+    repoURL: https://github.com/Piyush9565/deploy-bot-sandbox.git
+    targetRevision: main
+    path: apps/slack-deploy-bot
