@@ -1,0 +1,18 @@
+# ArgoCD permissions for the deploy bot's account, applied as a merge patch to argocd-rbac-cm:
+#   kubectl -n argocd patch cm argocd-rbac-cm --type merge --patch-file argocd/bot-rbac.yaml
+# Everyone else stays read-only by default (like Peddle prod). The bot may read and sync apps
+# in the listed projects only; devops (the bot's own app) and default are left out on purpose.
+data:
+  policy.default: role:readonly
+  policy.csv: |
+    p, role:slack-deployer, applications, get, sandbox/*, allow
+    p, role:slack-deployer, applications, sync, sandbox/*, allow
+    p, role:slack-deployer, applications, get, seller/*, allow
+    p, role:slack-deployer, applications, sync, seller/*, allow
+    p, role:slack-deployer, applications, get, buyer/*, allow
+    p, role:slack-deployer, applications, sync, buyer/*, allow
+    p, role:slack-deployer, applications, get, carrier/*, allow
+    p, role:slack-deployer, applications, sync, carrier/*, allow
+    p, role:slack-deployer, applications, get, auction/*, allow
+    p, role:slack-deployer, applications, sync, auction/*, allow
+    g, slack-deployer, role:slack-deployer

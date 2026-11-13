@@ -1,0 +1,57 @@
+# ArgoCD projects for the test services, named like Peddle's. The bot's account gets
+# get + sync on each of them (see argocd/bot-rbac.yaml).
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: seller
+  namespace: argocd
+spec:
+  description: Test seller services for the Slack deploy bot
+  sourceRepos:
+    - ghcr.io/stefanprodan/charts
+    - https://github.com/Piyush9565/deploy-bot-sandbox.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: sandbox
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: buyer
+  namespace: argocd
+spec:
+  description: Test buyer services for the Slack deploy bot
+  sourceRepos:
+    - ghcr.io/stefanprodan/charts
+    - https://github.com/Piyush9565/deploy-bot-sandbox.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: sandbox
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: carrier
+  namespace: argocd
+spec:
+  description: Test carrier services for the Slack deploy bot
+  sourceRepos:
+    - ghcr.io/stefanprodan/charts
+    - https://github.com/Piyush9565/deploy-bot-sandbox.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: sandbox
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: auction
+  namespace: argocd
+spec:
+  description: Test auction services for the Slack deploy bot
+  sourceRepos:
+    - ghcr.io/stefanprodan/charts
+    - https://github.com/Piyush9565/deploy-bot-sandbox.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: sandbox

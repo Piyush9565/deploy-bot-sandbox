@@ -13,5 +13,3 @@ spec:
   destinations:
     - server: https://kubernetes.default.svc
       namespace: podinfo
-    - server: https://kubernetes.default.svc
-      namespace: sandbox
