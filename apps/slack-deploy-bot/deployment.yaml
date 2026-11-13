@@ -41,7 +41,7 @@ spec:
           env:
             - name: SSM_PARAMETER_PATH
               value: /slack-deploy-bot
-            - name: AWS_REGION
+            - name: AWS_DEFAULT_REGION  # boto3 doesn't read AWS_REGION
               value: ap-southeast-2
             - name: ARGOCD_URL
               value: https://argocd-server.argocd.svc
