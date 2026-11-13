@@ -1,5 +1,7 @@
-# The bot itself: one pod running the image from ECR. Tokens and allowlists come from the
-# slack-deploy-bot-secrets Secret (filled from SSM by External Secrets); plain settings are below.
+# The bot itself: one pod running the image from ECR. At startup the bot reads its tokens and
+# allowlists straight from SSM Parameter Store (every parameter under SSM_PARAMETER_PATH, SecureStrings
+# decrypted) and keeps them in memory only. There's no Kubernetes Secret and no periodic refresh:
+# restart the pod to pick up changed values.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -35,8 +37,12 @@ spec:
       #     effect: NoSchedule
       containers:
         - name: bot
-          image: 885287756345.dkr.ecr.ap-southeast-2.amazonaws.com/slack-deploy-bot:17771a0
+          image: 885287756345.dkr.ecr.ap-southeast-2.amazonaws.com/slack-deploy-bot:af9188f
           env:
+            - name: SSM_PARAMETER_PATH
+              value: /slack-deploy-bot
+            - name: AWS_REGION
+              value: ap-southeast-2
             - name: ARGOCD_URL
               value: https://argocd-server.argocd.svc
             - name: ARGOCD_VERIFY_TLS
@@ -45,9 +51,6 @@ spec:
               value: "600"
             - name: CONFIRM_TTL_SECONDS
               value: "300"
-          envFrom:
-            - secretRef:
-                name: slack-deploy-bot-secrets
           resources:
             requests:
               cpu: 50m
