@@ -16,7 +16,33 @@ import urllib3
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-ARGOCD_URL = os.environ.get("ARGOCD_URL", "https://argocd-server.argocd.svc").rstrip("/")
+
+def load_ssm_parameters():
+    """Read settings from SSM Parameter Store once, at startup.
+
+    Every parameter under SSM_PARAMETER_PATH (e.g. /slack-deploy-bot/) becomes an environment
+    variable named after the last part of its name; SecureStrings are decrypted. Values are only
+    read here, so restart the pod to pick up changes. Without SSM_PARAMETER_PATH, plain
+    environment variables are used as they are.
+    """
+    path = os.environ.get("SSM_PARAMETER_PATH")
+    if not path:
+        return []
+    import boto3
+
+    names = []
+    pages = boto3.client("ssm").get_paginator("get_parameters_by_path")
+    for page in pages.paginate(Path=path, WithDecryption=True):
+        for parameter in page["Parameters"]:
+            name = parameter["Name"].rsplit("/", 1)[-1]
+            os.environ[name] = parameter["Value"]
+            names.append(name)
+    return sorted(names)
+
+
+LOADED_FROM_SSM = load_ssm_parameters()
+
+ARGOCD_URL =os.environ.get("ARGOCD_URL", "https://argocd-server.argocd.svc").rstrip("/")
 ARGOCD_VERIFY_TLS = os.environ.get("ARGOCD_VERIFY_TLS", "false").lower() == "true"
 ALLOWED_USERS = {u.strip() for u in os.environ["ALLOWED_USER_IDS"].split(",") if u.strip()}
 ALLOWED_CHANNELS = {c.strip() for c in os.environ["ALLOWED_CHANNEL_IDS"].split(",") if c.strip()}
@@ -340,6 +366,6 @@ def status_command(ack, command, respond):
 
 
 if __name__ == "__main__":
-    audit("bot_started", argocd=ARGOCD_URL,
+    audit("bot_started", argocd=ARGOCD_URL, loaded_from_ssm=LOADED_FROM_SSM,
           allowed_users=len(ALLOWED_USERS), allowed_channels=len(ALLOWED_CHANNELS))
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
