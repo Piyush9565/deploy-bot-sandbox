@@ -12,6 +12,8 @@ import os
 import re
 import threading
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import urllib3
@@ -51,6 +53,7 @@ ALLOWED_CHANNELS = {c.strip() for c in os.environ["ALLOWED_CHANNEL_IDS"].split("
 SYNC_TIMEOUT_SECONDS = int(os.environ.get("SYNC_TIMEOUT_SECONDS", "600"))
 CONFIRM_TTL_SECONDS = int(os.environ.get("CONFIRM_TTL_SECONDS", "300"))
 POLL_SECONDS = 5
+MAX_APPS_PER_REQUEST = 10
 APP_NAME = re.compile(r"[a-z0-9]([-a-z0-9]{0,251}[a-z0-9])?")
 
 argocd = requests.Session()
@@ -104,21 +107,31 @@ def duration(seconds):
     return f"{seconds // 60}m {seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
 
 
-def normalize_app_name(text):
-    """What someone typed, as an ArgoCD app name: lowercase, spaces and underscores as dashes."""
-    return re.sub(r"[\s_]+", "-", text.strip().lower())
+def parse_app_names(text):
+    """App names from a command, separated by spaces or commas: lowercased, underscores as dashes."""
+    names = []
+    for part in re.split(r"[\s,]+", text.strip().lower()):
+        name = part.replace("_", "-")
+        if name and name not in names:
+            names.append(name)
+    return names
 
 
 def suggest(typed, names, limit=3):
-    """App names closest to a typo: similar spelling, boosted when one name contains the other.
+    """App names closest to a typo: similar spelling of the whole name or of one of its words
+    ("buyr" -> "buyer-service"), boosted when one name contains the other.
 
     Only names nearly as close as the best match are kept, so a shared suffix like "-service"
     doesn't drag in unrelated apps.
     """
+    def similarity(a, b):
+        return difflib.SequenceMatcher(None, a, b).ratio()
+
     def score(name):
-        ratio = difflib.SequenceMatcher(None, typed, name).ratio()
+        whole = similarity(typed, name)
+        word = max(similarity(typed, part) for part in name.split("-")) - 0.1
         contained = len(typed) >= 3 and (typed in name or name in typed)
-        return ratio + (0.5 if contained else 0)
+        return max(whole, word) + (0.5 if contained else 0)
 
     scored = sorted(((score(n), n) for n in names), key=lambda s: (-s[0], s[1]))
     if not scored or scored[0][0] < 0.6:
@@ -301,42 +314,81 @@ def context(text):
     return {"type": "context", "elements": [mrkdwn(text)]}
 
 
-# Labels for the old and new versions, so they read right at each stage of a request.
-OPEN = ("Running now", "Will deploy")
-DEPLOYING = ("Running now", "Deploying")
-DEPLOYED = ("Previous version", "Now running")
-FAILED = ("Before", "Attempted")
-NOT_DEPLOYED = ("Running now", "Not deployed")
+# Labels for a single app's old and new versions, so they read right at each stage of a request.
+LABELS = {
+    "open": ("Running now", "Will deploy"),
+    "deploying": ("Running now", "Deploying"),
+    "deployed": ("Previous version", "Now running"),
+    "failed": ("Before", "Attempted"),
+    "not_deployed": ("Running now", "Not deployed"),
+}
 
 
-def request_blocks(payload, title, footer, labels=OPEN, buttons=False):
-    """A deploy request: title, application and versions, a one-line status, and buttons while open."""
-    old_label, new_label = labels
-    blocks = [
-        header(title),
-        {"type": "section", "fields": [
-            mrkdwn(f"*Application*\n`{payload['app']}`"),
-            mrkdwn(f"*Requested by*\n<@{payload['requester']}>"),
-            mrkdwn(f"*{old_label}*\n{versions(payload['live'])}"),
-            mrkdwn(f"*{new_label}*\n{versions(payload['images'])}"),
-        ]},
-        context(footer),
-    ]
+def app_line(entry, phase, result):
+    """One app's versions in a multi-app request, with its outcome once known."""
+    old, new = versions(entry["live"]), versions(entry["images"])
+    if result is True:
+        return f":white_check_mark: {new}  _(was {old})_"
+    if result is False:
+        return f":x: {new} failed  _(was {old})_"
+    if phase == "deploying":
+        return f":hourglass_flowing_sand: {old} → {new}"
+    if phase == "not_deployed":
+        return f"{old}  _(not deployed: {new})_"
+    return f"{old} → {new}"
+
+
+def request_blocks(request, title, footer, phase, results=None, buttons=False):
+    """A deploy request: title, apps and versions, a one-line status, and buttons while open.
+
+    One app gets the two-column card; several apps get one row each, with their own outcome.
+    """
+    results = results or {}
+    apps = request["apps"]
+    blocks = [header(title)]
+    if len(apps) == 1:
+        entry = apps[0]
+        result = results.get(entry["app"])
+        label_key = phase if result is None else ("deployed" if result else "failed")
+        old_label, new_label = LABELS[label_key]
+        blocks.append({"type": "section", "fields": [
+            mrkdwn(f"*Application*\n`{entry['app']}`"),
+            mrkdwn(f"*Requested by*\n<@{request['requester']}>"),
+            mrkdwn(f"*{old_label}*\n{versions(entry['live'])}"),
+            mrkdwn(f"*{new_label}*\n{versions(entry['images'])}"),
+        ]})
+    else:
+        blocks.append(context(f"Requested by <@{request['requester']}>  ·  {len(apps)} apps"))
+        for start in range(0, len(apps), 4):  # a section holds 10 fields: a header row + 4 apps
+            fields = [mrkdwn("*Application*"), mrkdwn("*Version*")]
+            for entry in apps[start:start + 4]:
+                fields += [mrkdwn(f"`{entry['app']}`"),
+                           mrkdwn(app_line(entry, phase, results.get(entry["app"])))]
+            blocks.append({"type": "section", "fields": fields})
+    if request.get("skipped"):
+        blocks.append(context(f"Already up to date, not included: {app_list(request['skipped'])}"))
+    blocks.append(context(footer))
     if buttons:
-        value = json.dumps(payload)
         blocks.append({"type": "actions", "elements": [
             {"type": "button", "action_id": "deploy_confirm", "style": "primary",
-             "text": {"type": "plain_text", "text": "Deploy"}, "value": value},
+             "text": {"type": "plain_text", "text": "Deploy" if len(apps) == 1 else f"Deploy {len(apps)} apps"},
+             "value": request["id"]},
             {"type": "button", "action_id": "deploy_cancel",
-             "text": {"type": "plain_text", "text": "Cancel"}, "value": value},
+             "text": {"type": "plain_text", "text": "Cancel"}, "value": request["id"]},
         ]})
     return blocks
 
 
-def update_request(client, channel, ts, payload, title, footer, labels):
+def update_request(client, channel, ts, request, title, footer, phase, results=None):
     """Rewrite the request message in place, without buttons, to show where the deploy stands."""
     client.chat_update(channel=channel, ts=ts, text=title,
-                       blocks=request_blocks(payload, title, footer, labels))
+                       blocks=request_blocks(request, title, footer, phase, results))
+
+
+def subject(request):
+    """How a request is named in titles: the app, or "N apps"."""
+    apps = request["apps"]
+    return apps[0]["app"] if len(apps) == 1 else f"{len(apps)} apps"
 
 
 def suggestion_blocks(typed, matches, action_prefix, verb):
@@ -350,6 +402,34 @@ def suggestion_blocks(typed, matches, action_prefix, verb):
     ]
 
 
+# Open deploy requests, keyed by the id in their buttons. Kept in memory: after a bot restart,
+# old buttons just say the request is gone.
+requests_by_id = {}
+requests_lock = threading.Lock()
+
+
+def save_request(request):
+    with requests_lock:
+        cutoff = time.time() - 3600
+        for request_id in [r for r, old in requests_by_id.items() if old["expires"] < cutoff]:
+            del requests_by_id[request_id]
+        requests_by_id[request["id"]] = request
+
+
+def take_request(request_id, user, new_status):
+    """Move an open request to a new status for its requester. Returns (request, problem)."""
+    with requests_lock:
+        request = requests_by_id.get(request_id)
+        if request is None:
+            return None, "This request is no longer available (the bot may have restarted). Run `/deploy` again."
+        if user != request["requester"]:
+            return None, "Only the person who ran /deploy can confirm or cancel it."
+        if request["status"] != "open":
+            return None, f"This request is already {request['status']}."
+        request["status"] = new_status
+        return request, None
+
+
 # --- Slack handlers --------------------------------------------------------------
 
 
@@ -357,18 +437,19 @@ def suggestion_blocks(typed, matches, action_prefix, verb):
 def deploy_command(ack, command, respond, client):
     ack()
     user, channel = command["user_id"], command["channel_id"]
-    name = normalize_app_name(command.get("text", ""))
+    names = parse_app_names(command.get("text", ""))
     if not allowed(user, channel):
-        audit("deploy_denied", user=user, channel=channel, app=name)
+        audit("deploy_denied", user=user, channel=channel, apps=names)
         respond("You're not allowed to deploy from here.")
         return
-    if not name:
+    if not names:
+        usage = "Usage: `/deploy <app> [more apps…]`, e.g. `/deploy seller-offer-service buyer-service`"
         try:
-            respond(f"Usage: `/deploy <application-name>`\nApps you can deploy: {app_list(deployable_apps())}")
+            respond(f"{usage}\nApps you can deploy: {app_list(deployable_apps())}")
         except Exception as e:  # noqa: BLE001 - report any ArgoCD problem back to Slack
-            respond(f"Usage: `/deploy <application-name>` (couldn't list apps from ArgoCD: {e})")
+            respond(f"{usage}\n(couldn't list apps from ArgoCD: {e})")
         return
-    request_deploy(name, user, channel, client, respond)
+    request_deploy(names, user, channel, client, respond)
 
 
 @app.action(re.compile(r"suggest_deploy_\d+"))
@@ -380,148 +461,233 @@ def suggest_deploy(ack, body, client, respond):
         respond(text="You're not allowed to deploy from here.", replace_original=True)
         return
     respond(delete_original=True)
-    request_deploy(body["actions"][0]["value"], user, channel, client, respond)
+    request_deploy([body["actions"][0]["value"]], user, channel, client, respond)
 
 
-def request_deploy(name, user, channel, client, respond):
-    """Post a deploy request for the app, or explain privately why not (with suggestions on typos)."""
-    try:
-        application = get_app(name, refresh=True) if APP_NAME.fullmatch(name) else None
-        if application is None:
-            deployable = deployable_apps()
-            matches = suggest(name, deployable)
-            audit("app_not_found", user=user, app=name, suggested=matches)
-            if matches:
-                respond(text=f"I couldn't find {name}.",
-                        blocks=suggestion_blocks(name, matches, "suggest_deploy", "Deploy"))
-            else:
-                respond(f":mag: I couldn't find `{name}`. Apps you can deploy: {app_list(deployable)}")
-            return
-        project = application["spec"]["project"]
-        if not can_sync(project, name):
-            audit("deploy_not_permitted", user=user, app=name, project=project)
-            respond(f":no_entry: `{name}` is in ArgoCD project `{project}`, which this bot isn't allowed to deploy.")
-            return
-        plan = build_plan(application)
-    except Exception as e:  # noqa: BLE001 - report any ArgoCD problem back to Slack
-        audit("plan_failed", user=user, app=name, error=str(e))
-        respond(f"Couldn't read `{name}` from ArgoCD: {e}")
-        return
+def check_app(name):
+    """Where one requested app stands: ("ready" | "up_to_date", plan), ("not_permitted", project),
+    or ("not_found", None)."""
+    application = get_app(name, refresh=True) if APP_NAME.fullmatch(name) else None
+    if application is None:
+        return "not_found", None
+    project = application["spec"]["project"]
+    if not can_sync(project, name):
+        return "not_permitted", project
+    plan = build_plan(application)
     if plan["sync_status"] == "Synced" and images_match(plan["live_images"], plan["target_images"]):
-        respond(f":white_check_mark: `{name}` is already up to date, running {versions(plan['live_images'])}.")
+        return "up_to_date", plan
+    return "ready", plan
+
+
+def request_deploy(names, user, channel, client, respond):
+    """Post one deploy request for the apps, or explain privately why not (with suggestions on typos)."""
+    if len(names) > MAX_APPS_PER_REQUEST:
+        respond(f"I can deploy up to {MAX_APPS_PER_REQUEST} apps at once; you listed {len(names)}.")
         return
-    payload = {
-        "app": name,
-        "revisions": plan["revisions"],  # pinned for the sync, not shown
-        "multi_source": plan["multi_source"],
-        "live": plan["live_images"],
-        "images": plan["target_images"],
+    try:
+        with ThreadPoolExecutor(max_workers=len(names)) as pool:
+            checks = dict(zip(names, pool.map(check_app, names)))
+        not_found = [n for n, (status, _) in checks.items() if status == "not_found"]
+        not_permitted = {n: project for n, (status, project) in checks.items() if status == "not_permitted"}
+        deployable = deployable_apps() if not_found else []
+    except Exception as e:  # noqa: BLE001 - report any ArgoCD problem back to Slack
+        audit("plan_failed", user=user, apps=names, error=str(e))
+        respond(f"Couldn't read the app{'s' if len(names) > 1 else ''} from ArgoCD: {e}")
+        return
+
+    if len(names) == 1 and not_found:
+        name = names[0]
+        matches = suggest(name, deployable)
+        audit("app_not_found", user=user, app=name, suggested=matches)
+        if matches:
+            respond(text=f"I couldn't find {name}.",
+                    blocks=suggestion_blocks(name, matches, "suggest_deploy", "Deploy"))
+        else:
+            respond(f":mag: I couldn't find `{name}`. Apps you can deploy: {app_list(deployable)}")
+        return
+    if len(names) == 1 and not_permitted:
+        name, project = next(iter(not_permitted.items()))
+        audit("deploy_not_permitted", user=user, app=name, project=project)
+        respond(f":no_entry: `{name}` is in ArgoCD project `{project}`, which this bot isn't allowed to deploy.")
+        return
+    if not_found or not_permitted:
+        lines = []
+        for name in not_found:
+            matches = suggest(name, deployable)
+            lines.append(f"• `{name}` not found" + (f". Did you mean {app_list(matches)}?" if matches else "."))
+        for name, project in not_permitted.items():
+            lines.append(f"• `{name}` is in ArgoCD project `{project}`, which this bot isn't allowed to deploy.")
+        audit("deploy_request_rejected", user=user, not_found=not_found, not_permitted=list(not_permitted))
+        respond(":warning: I didn't create a deploy request. Fix these and run `/deploy` again:\n" + "\n".join(lines))
+        return
+
+    ready = [(n, plan) for n, (status, plan) in checks.items() if status == "ready"]
+    skipped = [n for n, (status, _) in checks.items() if status == "up_to_date"]
+    if not ready:
+        respond(":white_check_mark: Already up to date: " + ", ".join(
+            f"`{n}` {versions(checks[n][1]['live_images'])}" for n in names))
+        return
+
+    request = {
+        "id": uuid.uuid4().hex[:12],
         "requester": user,
         "expires": int(time.time()) + CONFIRM_TTL_SECONDS,
+        "status": "open",
+        "skipped": skipped,
+        "apps": [{
+            "app": n,
+            "revisions": plan["revisions"],  # pinned for the sync, not shown
+            "multi_source": plan["multi_source"],
+            "live": plan["live_images"],
+            "images": plan["target_images"],
+        } for n, plan in ready],
     }
-    footer = (f"ArgoCD: {state(plan['sync_status'])}  ·  {state(plan['health'])}"
-              f"   |   Only <@{user}> can confirm, until "
-              f"{slack_time(payload['expires'], 'in 5 minutes', '{time}')}")
-    client.chat_postMessage(
-        channel=channel, text=f"Deploy {name}?",
-        blocks=request_blocks(payload, f":rocket:  Deploy {name}?", footer, OPEN, buttons=True),
-    )
-    audit("deploy_requested", user=user, channel=channel, app=name,
-          revisions=plan["revisions"], images=plan["target_images"])
+    save_request(request)
+    until = f"Only <@{user}> can confirm, until {slack_time(request['expires'], 'in 5 minutes', '{time}')}"
+    if len(ready) == 1:
+        plan = ready[0][1]
+        footer = f"ArgoCD: {state(plan['sync_status'])}  ·  {state(plan['health'])}   |   {until}"
+    else:
+        footer = f"All {len(ready)} apps deploy at the same time   |   {until}"
+    title = f":rocket:  Deploy {subject(request)}?"
+    client.chat_postMessage(channel=channel, text=title,
+                            blocks=request_blocks(request, title, footer, "open", buttons=True))
+    audit("deploy_requested", user=user, channel=channel, request=request["id"],
+          apps={a["app"]: {"revisions": a["revisions"], "images": a["images"]} for a in request["apps"]},
+          skipped=skipped)
 
 
 @app.action("deploy_cancel")
 def deploy_cancel(ack, body, client, respond):
     ack()
     user = body["user"]["id"]
-    payload = json.loads(body["actions"][0]["value"])
-    if user != payload["requester"]:
-        respond(text="Only the person who ran /deploy can cancel it.",
-                response_type="ephemeral", replace_original=False)
+    request, problem = take_request(body["actions"][0]["value"], user, "cancelled")
+    if problem:
+        respond(text=problem, response_type="ephemeral", replace_original=False)
         return
-    update_request(client, body["channel"]["id"], body["message"]["ts"], payload,
-                   f":no_entry_sign:  Deploy cancelled: {payload['app']}",
-                   f"Cancelled by <@{user}>. Nothing was deployed.", NOT_DEPLOYED)
-    audit("deploy_cancelled", user=user, app=payload["app"])
+    update_request(client, body["channel"]["id"], body["message"]["ts"], request,
+                   f":no_entry_sign:  Deploy cancelled: {subject(request)}",
+                   f"Cancelled by <@{user}>. Nothing was deployed.", "not_deployed")
+    audit("deploy_cancelled", user=user, request=request["id"], apps=[a["app"] for a in request["apps"]])
 
 
 @app.action("deploy_confirm")
 def deploy_confirm(ack, body, client, respond):
     ack()
     user, channel = body["user"]["id"], body["channel"]["id"]
-    payload = json.loads(body["actions"][0]["value"])
-    name = payload["app"]
-    if user != payload["requester"] or not allowed(user, channel):
-        audit("confirm_denied", user=user, channel=channel, app=name)
-        respond(text="Only the person who ran /deploy can confirm it.",
-                response_type="ephemeral", replace_original=False)
+    if not allowed(user, channel):
+        audit("confirm_denied", user=user, channel=channel)
+        respond(text="You're not allowed to deploy from here.", response_type="ephemeral", replace_original=False)
+        return
+    request, problem = take_request(body["actions"][0]["value"], user, "deploying")
+    if problem:
+        audit("confirm_denied", user=user, channel=channel, reason=problem)
+        respond(text=problem, response_type="ephemeral", replace_original=False)
         return
     message_ts = body["message"]["ts"]
-    if time.time() > payload["expires"]:
-        update_request(client, channel, message_ts, payload,
-                       f":hourglass:  Deploy request expired: {name}",
-                       f"Nothing was deployed. Run `/deploy {name}` again.", NOT_DEPLOYED)
+    names = [a["app"] for a in request["apps"]]
+    if time.time() > request["expires"]:
+        request["status"] = "expired"
+        update_request(client, channel, message_ts, request,
+                       f":hourglass:  Deploy request expired: {subject(request)}",
+                       f"Nothing was deployed. Run `/deploy {' '.join(names)}` again.", "not_deployed")
         return
     with in_flight_lock:
-        if name in in_flight:
-            respond(text=f"`{name}` is already being deployed.",
-                    response_type="ephemeral", replace_original=False)
-            return
-        in_flight.add(name)
-    update_request(client, channel, message_ts, payload,
-                   f":hourglass_flowing_sand:  Deploying {name}",
-                   f"Confirmed by <@{user}>  ·  syncing in ArgoCD, progress in the thread", DEPLOYING)
+        busy = [n for n in names if n in in_flight]
+        if not busy:
+            in_flight.update(names)
+    if busy:
+        request["status"] = "open"
+        respond(text=f"Already being deployed: {app_list(busy)}. Try again when that finishes.",
+                response_type="ephemeral", replace_original=False)
+        return
+    update_request(client, channel, message_ts, request,
+                   f":hourglass_flowing_sand:  Deploying {subject(request)}",
+                   f"Confirmed by <@{user}>  ·  syncing in ArgoCD, progress in the thread", "deploying")
     threading.Thread(
-        target=run_deploy, args=(client, channel, message_ts, payload, user), daemon=True,
+        target=run_deploys, args=(client, channel, message_ts, request, user), daemon=True,
     ).start()
 
 
-def run_deploy(client, channel, message_ts, payload, user):
-    name = payload["app"]
+def run_deploys(client, channel, message_ts, request, user):
+    """Sync every app in the request at the same time, reporting each result in the thread."""
+    apps = request["apps"]
+    multi = len(apps) > 1
     clock = time.monotonic()
+    results = {}
+    results_lock = threading.Lock()
 
     def say(text):
         client.chat_postMessage(channel=channel, thread_ts=message_ts, text=text)
 
-    def finish(ok, detail):
-        took = duration(time.monotonic() - clock)
-        if ok:
-            update_request(client, channel, message_ts, payload, f":white_check_mark:  Deployed {name}",
-                           f"Confirmed by <@{user}>  ·  healthy after {took}", DEPLOYED)
-            say(f":white_check_mark: `{name}` is running {versions(payload['images'])} and healthy ({took}).")
-        else:
-            update_request(client, channel, message_ts, payload, f":x:  Deploy failed: {name}",
-                           f"Confirmed by <@{user}>  ·  failed after {took}, details in the thread", FAILED)
-            say(f":x: `{name}`: {detail}")
-
-    try:
-        started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        start_sync(name, payload["revisions"], payload["multi_source"])
-        audit("sync_started", user=user, app=name, revisions=payload["revisions"])
-        say(f"Syncing `{name}` in ArgoCD. I'll post here when it's done "
-            f"(timeout {SYNC_TIMEOUT_SECONDS // 60} min).")
-        ok, detail = wait_for_rollout(name, started_at, payload["images"])
-        audit("deploy_finished", user=user, app=name, ok=ok, detail=detail)
-        finish(ok, detail)
-    except Exception as e:  # noqa: BLE001 - every failure must reach Slack
-        audit("deploy_error", user=user, app=name, error=str(e))
-        finish(False, str(e))
-    finally:
+    def deploy_one(entry):
+        name = entry["app"]
+        app_clock = time.monotonic()
+        try:
+            started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            start_sync(name, entry["revisions"], entry["multi_source"])
+            audit("sync_started", user=user, app=name, revisions=entry["revisions"], request=request["id"])
+            ok, detail = wait_for_rollout(name, started_at, entry["images"])
+        except Exception as e:  # noqa: BLE001 - every failure must reach Slack
+            ok, detail = False, str(e)
+        took = duration(time.monotonic() - app_clock)
+        audit("deploy_finished", user=user, app=name, ok=ok, detail=detail, request=request["id"])
         with in_flight_lock:
             in_flight.discard(name)
+        if ok:
+            say(f":white_check_mark: `{name}` is running {versions(entry['images'])} and healthy ({took}).")
+        else:
+            say(f":x: `{name}`: {detail}")
+        with results_lock:
+            results[name] = ok
+            snapshot = dict(results)
+        if multi and len(snapshot) < len(apps):  # live progress on the request message
+            update_request(client, channel, message_ts, request,
+                           f":hourglass_flowing_sand:  Deploying {subject(request)}",
+                           f"Confirmed by <@{user}>  ·  {len(snapshot)} of {len(apps)} finished",
+                           "deploying", snapshot)
+
+    if multi:
+        say(f"Syncing {len(apps)} apps in ArgoCD at the same time: {app_list([a['app'] for a in apps])}. "
+            f"I'll post each result here (timeout {SYNC_TIMEOUT_SECONDS // 60} min each).")
+    else:
+        say(f"Syncing `{apps[0]['app']}` in ArgoCD. I'll post here when it's done "
+            f"(timeout {SYNC_TIMEOUT_SECONDS // 60} min).")
+    try:
+        with ThreadPoolExecutor(max_workers=len(apps)) as pool:
+            list(pool.map(deploy_one, apps))
+    finally:
+        with in_flight_lock:
+            in_flight.difference_update(a["app"] for a in apps)
+
+    took = duration(time.monotonic() - clock)
+    succeeded = sum(1 for ok in results.values() if ok)
+    request["status"] = "finished"
+    if succeeded == len(apps):
+        title = f":white_check_mark:  Deployed {subject(request)}"
+        footer = f"Confirmed by <@{user}>  ·  healthy after {took}"
+    elif succeeded:
+        title = f":warning:  Deployed {succeeded} of {len(apps)} apps"
+        footer = f"Confirmed by <@{user}>  ·  finished after {took}, failures in the thread"
+    else:
+        title = f":x:  Deploy failed: {subject(request)}"
+        footer = f"Confirmed by <@{user}>  ·  failed after {took}, details in the thread"
+    update_request(client, channel, message_ts, request, title, footer, "done", results)
+    audit("request_finished", user=user, request=request["id"], succeeded=succeeded, total=len(apps))
 
 
 @app.command("/deploy-status")
 def status_command(ack, command, respond):
     ack()
-    name = normalize_app_name(command.get("text", ""))
+    names = parse_app_names(command.get("text", ""))
     if command["channel_id"] not in ALLOWED_CHANNELS:
         respond("This command only works in the deploy channel.")
         return
-    if not name:
-        respond(f"Usage: `/deploy-status <application-name>`\nApps: {app_list(sorted(n for n, _ in list_apps()))}")
+    if not names:
+        respond(f"Usage: `/deploy-status <app> [more apps…]`\nApps: {app_list(sorted(n for n, _ in list_apps()))}")
         return
-    show_status(name, respond)
+    for name in names[:MAX_APPS_PER_REQUEST]:
+        show_status(name, respond)
 
 
 @app.action(re.compile(r"suggest_status_\d+"))
