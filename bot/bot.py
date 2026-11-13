@@ -6,6 +6,7 @@ every sync is pinned to the exact revisions shown in the confirmation message.
 """
 
 import calendar
+import difflib
 import json
 import os
 import re
@@ -103,6 +104,36 @@ def duration(seconds):
     return f"{seconds // 60}m {seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
 
 
+def normalize_app_name(text):
+    """What someone typed, as an ArgoCD app name: lowercase, spaces and underscores as dashes."""
+    return re.sub(r"[\s_]+", "-", text.strip().lower())
+
+
+def suggest(typed, names, limit=3):
+    """App names closest to a typo: similar spelling, boosted when one name contains the other.
+
+    Only names nearly as close as the best match are kept, so a shared suffix like "-service"
+    doesn't drag in unrelated apps.
+    """
+    def score(name):
+        ratio = difflib.SequenceMatcher(None, typed, name).ratio()
+        contained = len(typed) >= 3 and (typed in name or name in typed)
+        return ratio + (0.5 if contained else 0)
+
+    scored = sorted(((score(n), n) for n in names), key=lambda s: (-s[0], s[1]))
+    if not scored or scored[0][0] < 0.6:
+        return []
+    best = scored[0][0]
+    return [n for s, n in scored if s >= max(0.6, best - 0.15)][:limit]
+
+
+def app_list(names, limit=25):
+    if not names:
+        return "_none_"
+    more = f" and {len(names) - limit} more" if len(names) > limit else ""
+    return ", ".join(f"`{n}`" for n in names[:limit]) + more
+
+
 def slack_time(unix, fallback, fmt="{date_short_pretty} at {time}"):
     """A timestamp Slack shows in each reader's own time zone."""
     return f"<!date^{int(unix)}^{fmt}|{fallback}>"
@@ -129,6 +160,36 @@ def get_app(name, refresh=False):
         return None
     r.raise_for_status()
     return r.json()
+
+
+def list_apps():
+    """(name, project) for every application the bot can see."""
+    r = argocd.get(f"{ARGOCD_URL}/api/v1/applications",
+                   params={"fields": "items.metadata.name,items.spec.project"}, timeout=60)
+    r.raise_for_status()
+    return [(a["metadata"]["name"], (a.get("spec") or {}).get("project", ""))
+            for a in r.json().get("items") or []]
+
+
+can_sync_cache = {}
+
+
+def can_sync(project, name="*"):
+    """Whether the bot's ArgoCD account may sync this app (answers cached for 5 minutes)."""
+    key = (project, name)
+    cached = can_sync_cache.get(key)
+    if cached and time.time() - cached[1] < 300:
+        return cached[0]
+    r = argocd.get(f"{ARGOCD_URL}/api/v1/account/can-i/applications/sync/{project}/{name}", timeout=20)
+    r.raise_for_status()
+    answer = r.json().get("value") == "yes"
+    can_sync_cache[key] = (answer, time.time())
+    return answer
+
+
+def deployable_apps():
+    """Names of the apps the bot is allowed to deploy (checked per ArgoCD project)."""
+    return sorted(name for name, project in list_apps() if project and can_sync(project))
 
 
 def is_multi_source(application):
@@ -278,6 +339,17 @@ def update_request(client, channel, ts, payload, title, footer, labels):
                        blocks=request_blocks(payload, title, footer, labels))
 
 
+def suggestion_blocks(typed, matches, action_prefix, verb):
+    """Private 'did you mean' message with a button for each close match."""
+    buttons = [{"type": "button", "action_id": f"{action_prefix}_{i}", "value": name,
+                "text": {"type": "plain_text", "text": f"{verb} {name}"[:75]}}
+               for i, name in enumerate(matches)]
+    return [
+        {"type": "section", "text": mrkdwn(f":mag: I couldn't find `{typed}`. Did you mean:")},
+        {"type": "actions", "elements": buttons},
+    ]
+
+
 # --- Slack handlers --------------------------------------------------------------
 
 
@@ -285,18 +357,50 @@ def update_request(client, channel, ts, payload, title, footer, labels):
 def deploy_command(ack, command, respond, client):
     ack()
     user, channel = command["user_id"], command["channel_id"]
-    name = command.get("text", "").strip()
+    name = normalize_app_name(command.get("text", ""))
     if not allowed(user, channel):
         audit("deploy_denied", user=user, channel=channel, app=name)
         respond("You're not allowed to deploy from here.")
         return
-    if not APP_NAME.fullmatch(name):
-        respond("Usage: `/deploy <application-name>`")
+    if not name:
+        try:
+            respond(f"Usage: `/deploy <application-name>`\nApps you can deploy: {app_list(deployable_apps())}")
+        except Exception as e:  # noqa: BLE001 - report any ArgoCD problem back to Slack
+            respond(f"Usage: `/deploy <application-name>` (couldn't list apps from ArgoCD: {e})")
         return
+    request_deploy(name, user, channel, client, respond)
+
+
+@app.action(re.compile(r"suggest_deploy_\d+"))
+def suggest_deploy(ack, body, client, respond):
+    """A 'did you mean' button: carry on as if the suggested name had been typed."""
+    ack()
+    user, channel = body["user"]["id"], body["channel"]["id"]
+    if not allowed(user, channel):
+        respond(text="You're not allowed to deploy from here.", replace_original=True)
+        return
+    respond(delete_original=True)
+    request_deploy(body["actions"][0]["value"], user, channel, client, respond)
+
+
+def request_deploy(name, user, channel, client, respond):
+    """Post a deploy request for the app, or explain privately why not (with suggestions on typos)."""
     try:
-        application = get_app(name, refresh=True)
+        application = get_app(name, refresh=True) if APP_NAME.fullmatch(name) else None
         if application is None:
-            respond(f"I can't find an application called `{name}` that I'm allowed to see.")
+            deployable = deployable_apps()
+            matches = suggest(name, deployable)
+            audit("app_not_found", user=user, app=name, suggested=matches)
+            if matches:
+                respond(text=f"I couldn't find {name}.",
+                        blocks=suggestion_blocks(name, matches, "suggest_deploy", "Deploy"))
+            else:
+                respond(f":mag: I couldn't find `{name}`. Apps you can deploy: {app_list(deployable)}")
+            return
+        project = application["spec"]["project"]
+        if not can_sync(project, name):
+            audit("deploy_not_permitted", user=user, app=name, project=project)
+            respond(f":no_entry: `{name}` is in ArgoCD project `{project}`, which this bot isn't allowed to deploy.")
             return
         plan = build_plan(application)
     except Exception as e:  # noqa: BLE001 - report any ArgoCD problem back to Slack
@@ -410,16 +514,37 @@ def run_deploy(client, channel, message_ts, payload, user):
 @app.command("/deploy-status")
 def status_command(ack, command, respond):
     ack()
-    name = command.get("text", "").strip()
+    name = normalize_app_name(command.get("text", ""))
     if command["channel_id"] not in ALLOWED_CHANNELS:
         respond("This command only works in the deploy channel.")
         return
-    if not APP_NAME.fullmatch(name):
-        respond("Usage: `/deploy-status <application-name>`")
+    if not name:
+        respond(f"Usage: `/deploy-status <application-name>`\nApps: {app_list(sorted(n for n, _ in list_apps()))}")
         return
-    application = get_app(name, refresh=True)
+    show_status(name, respond)
+
+
+@app.action(re.compile(r"suggest_status_\d+"))
+def suggest_status(ack, body, respond):
+    """A 'did you mean' button on /deploy-status: show the suggested app instead."""
+    ack()
+    if body["channel"]["id"] not in ALLOWED_CHANNELS:
+        respond(text="This command only works in the deploy channel.", replace_original=True)
+        return
+    respond(delete_original=True)
+    show_status(body["actions"][0]["value"], respond)
+
+
+def show_status(name, respond):
+    application = get_app(name, refresh=True) if APP_NAME.fullmatch(name) else None
     if application is None:
-        respond(f"I can't find an application called `{name}` that I'm allowed to see.")
+        names = sorted(n for n, _ in list_apps())
+        matches = suggest(name, names)
+        if matches:
+            respond(text=f"I couldn't find {name}.",
+                    blocks=suggestion_blocks(name, matches, "suggest_status", "Status of"))
+        else:
+            respond(f":mag: I couldn't find `{name}`. Apps: {app_list(names)}")
         return
     status = application["status"]
     sync = status.get("sync", {}).get("status", "Unknown")
