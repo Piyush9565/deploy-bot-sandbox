@@ -5,6 +5,7 @@ syncs what is already merged in Git: it never picks images or edits values, and
 every sync is pinned to the exact revisions shown in the confirmation message.
 """
 
+import calendar
 import json
 import os
 import re
@@ -74,18 +75,37 @@ def allowed(user_id, channel_id):
     return user_id in ALLOWED_USERS and channel_id in ALLOWED_CHANNELS
 
 
-def short(revision):
-    return revision[:7] if re.fullmatch(r"[0-9a-f]{40}", revision) else revision
-
-
-def code_list(items):
-    return ", ".join(f"`{i}`" for i in items) or "_none_"
-
-
 def image_repo(image):
     name = image.split("@", 1)[0]
     head, _, tail = name.rpartition(":")
     return head if head and "/" not in tail else name
+
+
+def image_tag(image):
+    """Just the version part of an image reference: its tag, or a short digest."""
+    if "@" in image:
+        return image.split("@", 1)[1][:19]
+    repo = image_repo(image)
+    return image[len(repo) + 1:] if len(image) > len(repo) else "latest"
+
+
+def versions(images):
+    """Image tags for display; the image name is added only when there's more than one image."""
+    if not images:
+        return "_nothing running_"
+    if len(images) == 1:
+        return f"`{image_tag(images[0])}`"
+    return "\n".join(f"{image_repo(i).rsplit('/', 1)[-1]} `{image_tag(i)}`" for i in images)
+
+
+def duration(seconds):
+    seconds = int(seconds)
+    return f"{seconds // 60}m {seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
+
+
+def slack_time(unix, fallback, fmt="{date_short_pretty} at {time}"):
+    """A timestamp Slack shows in each reader's own time zone."""
+    return f"<!date^{int(unix)}^{fmt}|{fallback}>"
 
 
 def images_match(live, expected):
@@ -197,42 +217,56 @@ def wait_for_rollout(name, started_at, expected_images):
 # --- Slack messages -------------------------------------------------------------
 
 
-def plan_text(plan, user):
-    return "\n".join([
-        f"*Deploy `{plan['name']}`?* Requested by <@{user}>",
-        f"Now running: {code_list(plan['live_images'])}",
-        f"Will deploy: {code_list(plan['target_images'])}",
-        f"Pinned revisions: {code_list(short(r) for r in plan['revisions'])}",
-        f"ArgoCD: {plan['sync_status']}, {plan['health']}",
-    ])
+STATE_EMOJI = {
+    "Synced": ":large_green_circle:", "Healthy": ":large_green_circle:",
+    "OutOfSync": ":large_yellow_circle:", "Progressing": ":large_blue_circle:",
+    "Degraded": ":red_circle:", "Missing": ":white_circle:",
+}
 
 
-def section(text):
-    return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+def state(value):
+    return f"{STATE_EMOJI.get(value, ':white_circle:')} {value}"
 
 
-def confirm_blocks(plan, user, value):
-    return [
-        section(plan_text(plan, user)),
-        {
-            "type": "actions",
-            "elements": [
-                {"type": "button", "action_id": "deploy_confirm", "style": "primary",
-                 "text": {"type": "plain_text", "text": "Deploy"}, "value": value},
-                {"type": "button", "action_id": "deploy_cancel",
-                 "text": {"type": "plain_text", "text": "Cancel"}, "value": value},
-            ],
-        },
+def mrkdwn(text):
+    return {"type": "mrkdwn", "text": text}
+
+
+def header(text):
+    return {"type": "header", "text": {"type": "plain_text", "text": text[:150], "emoji": True}}
+
+
+def context(text):
+    return {"type": "context", "elements": [mrkdwn(text)]}
+
+
+def request_blocks(payload, title, footer, buttons=False):
+    """A deploy request: title, application and versions, a one-line status, and buttons while open."""
+    blocks = [
+        header(title),
+        {"type": "section", "fields": [
+            mrkdwn(f"*Application*\n`{payload['app']}`"),
+            mrkdwn(f"*Requested by*\n<@{payload['requester']}>"),
+            mrkdwn(f"*Running now*\n{versions(payload['live'])}"),
+            mrkdwn(f"*Will deploy*\n{versions(payload['images'])}"),
+        ]},
+        context(footer),
     ]
+    if buttons:
+        value = json.dumps(payload)
+        blocks.append({"type": "actions", "elements": [
+            {"type": "button", "action_id": "deploy_confirm", "style": "primary",
+             "text": {"type": "plain_text", "text": "Deploy"}, "value": value},
+            {"type": "button", "action_id": "deploy_cancel",
+             "text": {"type": "plain_text", "text": "Cancel"}, "value": value},
+        ]})
+    return blocks
 
 
-def close_message(client, body, note):
-    """Replace the buttons with a note, keeping the original summary."""
-    summary = body["message"]["blocks"][0]["text"]["text"]
-    client.chat_update(
-        channel=body["channel"]["id"], ts=body["message"]["ts"],
-        text=note, blocks=[section(summary), section(note)],
-    )
+def update_request(client, channel, ts, payload, title, footer):
+    """Rewrite the request message in place, without buttons, to show where the deploy stands."""
+    client.chat_update(channel=channel, ts=ts, text=title,
+                       blocks=request_blocks(payload, title, footer))
 
 
 # --- Slack handlers --------------------------------------------------------------
@@ -261,19 +295,23 @@ def deploy_command(ack, command, respond, client):
         respond(f"Couldn't read `{name}` from ArgoCD: {e}")
         return
     if plan["sync_status"] == "Synced" and images_match(plan["live_images"], plan["target_images"]):
-        respond(f"`{name}` is already up to date ({code_list(plan['live_images'])}).")
+        respond(f":white_check_mark: `{name}` is already up to date, running {versions(plan['live_images'])}.")
         return
     payload = {
         "app": name,
-        "revisions": plan["revisions"],
+        "revisions": plan["revisions"],  # pinned for the sync, not shown
         "multi_source": plan["multi_source"],
+        "live": plan["live_images"],
         "images": plan["target_images"],
         "requester": user,
         "expires": int(time.time()) + CONFIRM_TTL_SECONDS,
     }
+    footer = (f"ArgoCD: {state(plan['sync_status'])}  ·  {state(plan['health'])}"
+              f"   |   Only <@{user}> can confirm, until "
+              f"{slack_time(payload['expires'], 'in 5 minutes', '{time}')}")
     client.chat_postMessage(
         channel=channel, text=f"Deploy {name}?",
-        blocks=confirm_blocks(plan, user, json.dumps(payload)),
+        blocks=request_blocks(payload, f":rocket:  Deploy {name}?", footer, buttons=True),
     )
     audit("deploy_requested", user=user, channel=channel, app=name,
           revisions=plan["revisions"], images=plan["target_images"])
@@ -288,7 +326,9 @@ def deploy_cancel(ack, body, client, respond):
         respond(text="Only the person who ran /deploy can cancel it.",
                 response_type="ephemeral", replace_original=False)
         return
-    close_message(client, body, f"Cancelled by <@{user}>.")
+    update_request(client, body["channel"]["id"], body["message"]["ts"], payload,
+                   f":no_entry_sign:  Deploy cancelled: {payload['app']}",
+                   f"Cancelled by <@{user}>. Nothing was deployed.")
     audit("deploy_cancelled", user=user, app=payload["app"])
 
 
@@ -303,8 +343,11 @@ def deploy_confirm(ack, body, client, respond):
         respond(text="Only the person who ran /deploy can confirm it.",
                 response_type="ephemeral", replace_original=False)
         return
+    message_ts = body["message"]["ts"]
     if time.time() > payload["expires"]:
-        close_message(client, body, "This request expired. Run `/deploy` again.")
+        update_request(client, channel, message_ts, payload,
+                       f":hourglass:  Deploy request expired: {name}",
+                       f"Nothing was deployed. Run `/deploy {name}` again.")
         return
     with in_flight_lock:
         if name in in_flight:
@@ -312,30 +355,44 @@ def deploy_confirm(ack, body, client, respond):
                     response_type="ephemeral", replace_original=False)
             return
         in_flight.add(name)
-    close_message(client, body, f"Confirmed by <@{user}>. Deploying...")
+    update_request(client, channel, message_ts, payload,
+                   f":hourglass_flowing_sand:  Deploying {name}",
+                   f"Confirmed by <@{user}>  ·  syncing in ArgoCD, progress in the thread")
     threading.Thread(
-        target=run_deploy, args=(client, channel, body["message"]["ts"], payload, user), daemon=True,
+        target=run_deploy, args=(client, channel, message_ts, payload, user), daemon=True,
     ).start()
 
 
-def run_deploy(client, channel, thread_ts, payload, user):
+def run_deploy(client, channel, message_ts, payload, user):
     name = payload["app"]
+    clock = time.monotonic()
 
     def say(text):
-        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+        client.chat_postMessage(channel=channel, thread_ts=message_ts, text=text)
+
+    def finish(ok, detail):
+        took = duration(time.monotonic() - clock)
+        if ok:
+            update_request(client, channel, message_ts, payload, f":white_check_mark:  Deployed {name}",
+                           f"Confirmed by <@{user}>  ·  healthy after {took}")
+            say(f":white_check_mark: `{name}` is running {versions(payload['images'])} and healthy ({took}).")
+        else:
+            update_request(client, channel, message_ts, payload, f":x:  Deploy failed: {name}",
+                           f"Confirmed by <@{user}>  ·  failed after {took}, details in the thread")
+            say(f":x: `{name}`: {detail}")
 
     try:
         started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         start_sync(name, payload["revisions"], payload["multi_source"])
         audit("sync_started", user=user, app=name, revisions=payload["revisions"])
-        say(f"Sync started in ArgoCD. Watching the rollout (timeout {SYNC_TIMEOUT_SECONDS // 60} min)...")
+        say(f"Syncing `{name}` in ArgoCD. I'll post here when it's done "
+            f"(timeout {SYNC_TIMEOUT_SECONDS // 60} min).")
         ok, detail = wait_for_rollout(name, started_at, payload["images"])
         audit("deploy_finished", user=user, app=name, ok=ok, detail=detail)
-        icon = ":white_check_mark:" if ok else ":x:"
-        say(f"{icon} `{name}`: {detail}")
-    except Exception as e:  # noqa: BLE001 - every failure must reach the thread
+        finish(ok, detail)
+    except Exception as e:  # noqa: BLE001 - every failure must reach Slack
         audit("deploy_error", user=user, app=name, error=str(e))
-        say(f":x: `{name}`: {e}")
+        finish(False, str(e))
     finally:
         with in_flight_lock:
             in_flight.discard(name)
@@ -356,13 +413,23 @@ def status_command(ack, command, respond):
         respond(f"I can't find an application called `{name}` that I'm allowed to see.")
         return
     status = application["status"]
+    sync = status.get("sync", {}).get("status", "Unknown")
+    health = status.get("health", {}).get("status", "Unknown")
     operation = status.get("operationState") or {}
-    respond("\n".join([
-        f"*`{name}`*: {status.get('sync', {}).get('status')}, {status.get('health', {}).get('status')}",
-        f"Running: {code_list(sorted(status.get('summary', {}).get('images', [])))}",
-        f"Last sync: {operation.get('phase', 'never')} at {operation.get('finishedAt', '-')}"
-        f" by {operation.get('operation', {}).get('initiatedBy', {}).get('username', '-')}",
-    ]))
+    last = "_never_"
+    if operation.get("finishedAt"):
+        finished = calendar.timegm(time.strptime(operation["finishedAt"], "%Y-%m-%dT%H:%M:%SZ"))
+        by = operation.get("operation", {}).get("initiatedBy", {}).get("username", "automated")
+        last = f"{operation.get('phase', '')} {slack_time(finished, operation['finishedAt'])}\nby {by}"
+    respond(text=f"{name}: {sync}, {health}", blocks=[
+        header(f":mag:  {name}"),
+        {"type": "section", "fields": [
+            mrkdwn(f"*Sync*\n{state(sync)}"),
+            mrkdwn(f"*Health*\n{state(health)}"),
+            mrkdwn(f"*Running*\n{versions(sorted(status.get('summary', {}).get('images', [])))}"),
+            mrkdwn(f"*Last deploy*\n{last}"),
+        ]},
+    ])
 
 
 if __name__ == "__main__":
