@@ -37,7 +37,7 @@ spec:
       #     effect: NoSchedule
       containers:
         - name: bot
-          image: 885287756345.dkr.ecr.ap-southeast-2.amazonaws.com/slack-deploy-bot:dcb5d1b
+          image: 885287756345.dkr.ecr.ap-southeast-2.amazonaws.com/slack-deploy-bot:ca7b1b3
           env:
             - name: SSM_PARAMETER_PATH
               value: /slack-deploy-bot
