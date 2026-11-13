@@ -1,0 +1,25 @@
+# CodeBuild: builds bot/ into an image and pushes it to ECR, tagged with the short Git SHA.
+# The project has no source attached; it clones this public repo at GIT_REF.
+version: 0.2
+
+env:
+  variables:
+    REPO_URL: https://github.com/Piyush9565/deploy-bot-sandbox.git
+    GIT_REF: main
+    IMAGE_REPO: slack-deploy-bot
+
+phases:
+  pre_build:
+    commands:
+      - git clone --quiet "$REPO_URL" "$CODEBUILD_SRC_DIR/src"
+      - cd "$CODEBUILD_SRC_DIR/src" && git checkout --quiet "$GIT_REF"
+      - export IMAGE_TAG="$(git -C "$CODEBUILD_SRC_DIR/src" rev-parse --short=7 HEAD)"
+      - export REGISTRY="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com"
+      - aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
+  build:
+    commands:
+      - docker build --tag "$REGISTRY/$IMAGE_REPO:$IMAGE_TAG" "$CODEBUILD_SRC_DIR/src/bot"
+  post_build:
+    commands:
+      - docker push "$REGISTRY/$IMAGE_REPO:$IMAGE_TAG"
+      - echo "Pushed $REGISTRY/$IMAGE_REPO:$IMAGE_TAG"
