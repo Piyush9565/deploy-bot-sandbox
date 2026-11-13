@@ -1,7 +1,7 @@
 # Test app for the deploy bot (podinfo standing in for a real service).
 image:
   repository: ghcr.io/stefanprodan/podinfo
-  tag: 6.15.0
+  tag: 6.16.0
 replicaCount: 1
 ui:
   message: buyer-frontend
