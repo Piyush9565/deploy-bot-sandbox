@@ -1,0 +1,111 @@
+# Five more test apps in the sandbox project, named like Peddle services so the bot's
+# typo suggestions have similar names to choose between. Same shape as podinfo.yaml.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: seller-offer-service
+  namespace: argocd
+spec:
+  project: sandbox
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sandbox
+  syncPolicy: {}
+  sources:
+    - repoURL: ghcr.io/stefanprodan/charts
+      chart: podinfo
+      targetRevision: 6.17.0
+      helm:
+        valueFiles:
+          - $values/apps/seller-offer-service/values.yaml
+    - repoURL: https://github.com/Piyush9565/deploy-bot-sandbox.git
+      targetRevision: main
+      ref: values
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: seller-account-service
+  namespace: argocd
+spec:
+  project: sandbox
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sandbox
+  syncPolicy: {}
+  sources:
+    - repoURL: ghcr.io/stefanprodan/charts
+      chart: podinfo
+      targetRevision: 6.17.0
+      helm:
+        valueFiles:
+          - $values/apps/seller-account-service/values.yaml
+    - repoURL: https://github.com/Piyush9565/deploy-bot-sandbox.git
+      targetRevision: main
+      ref: values
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: buyer-service
+  namespace: argocd
+spec:
+  project: sandbox
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sandbox
+  syncPolicy: {}
+  sources:
+    - repoURL: ghcr.io/stefanprodan/charts
+      chart: podinfo
+      targetRevision: 6.17.0
+      helm:
+        valueFiles:
+          - $values/apps/buyer-service/values.yaml
+    - repoURL: https://github.com/Piyush9565/deploy-bot-sandbox.git
+      targetRevision: main
+      ref: values
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: carrier-service
+  namespace: argocd
+spec:
+  project: sandbox
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sandbox
+  syncPolicy: {}
+  sources:
+    - repoURL: ghcr.io/stefanprodan/charts
+      chart: podinfo
+      targetRevision: 6.17.0
+      helm:
+        valueFiles:
+          - $values/apps/carrier-service/values.yaml
+    - repoURL: https://github.com/Piyush9565/deploy-bot-sandbox.git
+      targetRevision: main
+      ref: values
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: auction-service
+  namespace: argocd
+spec:
+  project: sandbox
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sandbox
+  syncPolicy: {}
+  sources:
+    - repoURL: ghcr.io/stefanprodan/charts
+      chart: podinfo
+      targetRevision: 6.17.0
+      helm:
+        valueFiles:
+          - $values/apps/auction-service/values.yaml
+    - repoURL: https://github.com/Piyush9565/deploy-bot-sandbox.git
+      targetRevision: main
+      ref: values

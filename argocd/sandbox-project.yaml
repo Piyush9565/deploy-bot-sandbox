@@ -1,0 +1,17 @@
+# ArgoCD project for the apps the deploy bot may deploy. The bot's ArgoCD account
+# (slack-deployer) has get + sync on sandbox/* only.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: sandbox
+  namespace: argocd
+spec:
+  description: Test apps for the Slack deploy bot
+  sourceRepos:
+    - ghcr.io/stefanprodan/charts
+    - https://github.com/Piyush9565/deploy-bot-sandbox.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: podinfo
+    - server: https://kubernetes.default.svc
+      namespace: sandbox
